@@ -1,98 +1,152 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import argparse
+import os
+import pathlib
 
-import cv2
+import click
 import mmcv
 from mmcv.transforms import Compose
-from mmengine.utils import track_iter_progress
-
 from mmdet.apis import inference_detector, init_detector
 from mmdet.registry import VISUALIZERS
+from mmengine.utils import track_iter_progress
+from moviepy.editor import ImageSequenceClip
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="MMDetection video demo")
-    parser.add_argument("video", help="Video file")
-    parser.add_argument("config", help="Config file")
-    parser.add_argument("checkpoint", help="Checkpoint file")
-    parser.add_argument("--device", default="cuda:0", help="Device used for inference")
-    parser.add_argument(
-        "--score-thr", type=float, default=0.3, help="Bbox score threshold"
-    )
-    parser.add_argument("--out", type=str, help="Output video file")
-    parser.add_argument("--show", action="store_true", help="Show video")
-    parser.add_argument(
-        "--wait-time",
-        type=float,
-        default=1,
-        help="The interval of show (s), 0 is block",
-    )
-    args = parser.parse_args()
-    return args
-
-
-def main():
-    args = parse_args()
-    assert args.out or args.show, (
-        "Please specify at least one operation (save/show the "
-        'video) with the argument "--out" or "--show"'
-    )
-
-    # build the model from a config file and a checkpoint file
-    model = init_detector(args.config, args.checkpoint, device=args.device)
-
-    # build test pipeline
+@click.command()
+@click.argument(
+    "input",
+    nargs=1,
+    required=True,
+    type=click.Path(
+        file_okay=False,
+        dir_okay=True,
+        exists=True,
+        readable=True,
+        path_type=pathlib.Path,
+    ),
+)
+@click.argument(
+    "output",
+    nargs=1,
+    required=True,
+    type=click.Path(
+        file_okay=False,
+        dir_okay=True,
+        path_type=pathlib.Path,
+    ),
+)
+@click.argument(
+    "config",
+    nargs=1,
+    required=True,
+    type=click.Path(
+        file_okay=True,
+        dir_okay=False,
+        exists=True,
+        readable=True,
+        path_type=pathlib.Path,
+    ),
+)
+@click.argument(
+    "checkpoint",
+    nargs=1,
+    required=True,
+    type=click.Path(
+        file_okay=True,
+        dir_okay=False,
+        exists=True,
+        readable=True,
+        path_type=pathlib.Path,
+    ),
+)
+@click.option(
+    "--extension",
+    "-x",
+    type=str,
+    nargs=1,
+    default="mp4",
+    help="The filename extension filter.",
+)
+@click.option(
+    "--score-thr",
+    type=float,
+    nargs=1,
+    default=0.3,
+    help="Bbox score threshold.",
+)
+def main(input, output, config, checkpoint, extension, score_thr):
+    model = init_detector(str(config), str(checkpoint), device="cuda")
     model.cfg.test_dataloader.dataset.pipeline[0].type = "LoadImageFromNDArray"
+
     test_pipeline = Compose(model.cfg.test_dataloader.dataset.pipeline)
 
-    # init visualizer
     visualizer = VISUALIZERS.build(model.cfg.visualizer)
-    # the dataset_meta is loaded from the checkpoint and
-    # then pass to the model in init_detector
     visualizer.dataset_meta = model.dataset_meta
-    labels = model.dataset_meta
 
-    labels = model.dataset_meta['classes']
-    # print(labels)
+    labels = model.dataset_meta["classes"]
 
-    video_reader = mmcv.VideoReader(args.video)
-    video_writer = None
-    count = 0
-    if args.out:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_writer = cv2.VideoWriter(
-            args.out,
-            fourcc,
-            video_reader.fps,
-            (video_reader.width, video_reader.height),
-        )
+    for action in input.iterdir():
+        if not os.path.isdir(action):
+            continue
 
-    for frame in track_iter_progress(video_reader):
-        result = inference_detector(model, frame, test_pipeline=test_pipeline)
-        visualizer.add_datasample(
-            name="video",
-            image=frame,
-            data_sample=result,
-            draw_gt=False,
-            show=False,
-            pred_score_thr=args.score_thr,
-        )
-        frame = visualizer.get_image()
+        for video in action.iterdir():
+            if video.suffix != f".{extension}":
+                continue
 
-        # if count == 0:
-        #     print(result.pred_instances)
+            video_reader = mmcv.VideoReader(str(video))
+            output_frames = []
+            output_video_path = output / action.name / video.with_suffix(".mp4").name
+            first = True
 
-        if args.show:
-            cv2.namedWindow("video", 0)
-            mmcv.imshow(frame, "video", args.wait_time)
-        if args.out:
-            video_writer.write(frame)
+            output_video_path.parent.mkdir(parents=True, exist_ok=True)
 
-        count += 1
+            for frame in track_iter_progress(video_reader):
+                result = inference_detector(model, frame, test_pipeline=test_pipeline)
 
-    if video_writer:
-        video_writer.release()
-    cv2.destroyAllWindows()
+                # result.pred_instances = [
+                #     i for i in result.pred_instances if i.labels[0] == 0
+                # ]
+
+                # for item in result.pred_instances:
+                # if item.labels[0] != 0:
+                # del item
+
+                # for item in result.pred_instances:
+                #     if item.labels[0] != 0:
+                #         result.pred_instances = item
+                # print(labels[item.labels[0]])
+
+                pred_copy = result.pred_instances
+
+                for item in pred_copy:
+                    if item.labels[0] != 0:
+                        del item
+
+                result.pred_instances = pred_copy
+
+                visualizer.add_datasample(
+                    name="video",
+                    image=frame,
+                    data_sample=result,
+                    draw_gt=False,
+                    show=False,
+                    pred_score_thr=score_thr,
+                )
+
+                frame = visualizer.get_image()
+
+                output_frames.append(frame)
+
+                # if first:
+                #     print(type(result))
+                #     print(type(result.pred_instances))
+                #     first = False
+
+            ImageSequenceClip(
+                output_frames, fps=video_reader.fps
+            ).without_audio().write_videofile(str(output_video_path))
+
+            break
+        break
 
 
 if __name__ == "__main__":
